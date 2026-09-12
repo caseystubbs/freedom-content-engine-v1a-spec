@@ -1,7 +1,7 @@
 # Freedom Content Engine
 ## V1A Implementation Specification
 
-**Status:** Final-review draft — transport and PostgreSQL capability gates remain unproven; do not implement yet  
+**Status:** Final-review draft — pre-code approval, PostgreSQL, and Work transport gates remain open; do not implement yet
 **Architecture source:** *Freedom Content Engine — Architecture Approved for V1A Implementation*  
 **Scope:** V1A only  
 **Date:** September 12, 2026  
@@ -59,15 +59,24 @@ V1A must not implement or activate:
 - A replacement Substack browser extension
 - An OpenAI API content-generation path for V1A content
 
-### 1.3 Open pre-implementation gates
+### 1.3 Open pre-code gates
 
-These are intentionally open in this final-review draft:
+These gates must close before implementation work begins:
 
-- **ChatGPT Work transport capability:** not yet proven in Casey’s actual ChatGPT Work environment. No transport is authorized until the spike in Section 5.2 passes.
-- **Railway PostgreSQL version:** not yet verified from the actual production database. The repository’s PostgreSQL 15 README statement is not evidence. The version query in Section 6.1 must be run and recorded before migration design is approved.
-- **ECC database authority enforcement:** specified below, but not implemented or verified. The ECC-side trigger, deferred mapping constraint, unique exact-version index, and adapter database role are mandatory prerequisites to cutover.
+- **Casey specification approval:** Casey explicitly approves this implementation specification.
+- **Railway PostgreSQL version:** the actual production `version()`, `server_version_num`, `server_version`, and `pgcrypto` extension version are verified and recorded. The repository’s PostgreSQL 15 README statement is not evidence.
+- **ChatGPT Work transport capability:** the required spike in Section 5.2 passes in Casey’s actual ChatGPT Work environment. No Work transport is authorized until it passes.
 
-Until all three gates are closed and Casey approves this document, production implementation remains paused.
+Once these three pre-code gates close, implementation may proceed through Phases 0–6. ECC enforcement, the complete automated V1A test suite, dark launch, adapter canary, and rollback checks are pre-cutover gates, not prerequisites to writing the code that creates and verifies them.
+
+### 1.4 Pre-cutover gates
+
+Before Hub authority is cut over and before any audience-facing workflow is enabled, all of the following must pass:
+
+- The complete automated V1A test suite passes in a non-production environment.
+- ECC authority/database enforcement is installed and verified, including the writer guard, database trigger, deferred exact-version mapping constraint, unique exact-version index, and adapter database role.
+- The dark launch and internal adapter canary pass with no audience-facing send or publication.
+- Rollback checks pass, including authority rollback, reconciliation handling, and confirmation that final send/publish remains manual.
 
 ---
 
@@ -166,7 +175,7 @@ system:migration
 system:reconciliation
 ```
 
-`human:casey` is resolved server-side from the authenticated Hub owner session and is never accepted as request-supplied text. `work:<key_id>` may identify a Work credential, but every claim also records the distinct Work execution/session identity, claim ID, and lease ID. Secrets are never stored in actor rows or content records.
+`human:casey` is resolved server-side from the authenticated Hub owner session and is never accepted as request-supplied text. `work:<key_id>` may identify a Work credential, but every claim also records the server-generated `hub_work_execution_id`, optional provider-native execution reference, claim ID, and lease ID. Secrets are never stored in actor rows or content records.
 
 The actor record is bound to an authenticated identity through `content_actor_bindings`:
 
@@ -318,15 +327,17 @@ Work never receives the ECC draft-write credential, Substack action credential, 
 
 ### 5.2 Required transport-capability spike
 
-The spike is a mandatory pre-implementation gate and must run through Casey’s actual ChatGPT Work environment, not through an Adaptive simulation or a developer-only HTTP client. It must use an isolated/non-production Hub test job and must not touch ECC, Substack, production content, production drafts, production sends, or production publications.
+The spike is a mandatory pre-code gate and must run through Casey’s actual ChatGPT Work environment, not through an Adaptive simulation or a developer-only HTTP client. It must use an isolated/non-production Hub test job and must not touch ECC, Substack, production content, production drafts, production sends, or production publications.
 
 The spike must prove, using the candidate transport:
 
 1. Work authenticates to Freedom Hub using the actual supported connection mechanism.
 2. Work retrieves one harmless test job containing no business content or recipient data.
-3. Hub atomically claims that test job and returns a server-generated short-lived claim/lease token.
-4. Work submits one harmless test result tied to the claim/session identity.
-5. Work repeats the same result request or re-reads the result after a simulated response loss and receives/reuses the original receipt without creating a duplicate submission, output version, or job completion side effect.
+3. Hub atomically claims that test job and generates a server-side `hub_work_execution_id`, `claim_id`, `lease_id`, and short-lived claim token.
+4. Work heartbeats the claim and Hub extends the lease within the timing that Casey’s actual Work environment can reliably support.
+5. Work submits one harmless result tied to the claim, lease, execution identity, `context_snapshot_id`, and `context_hash`.
+6. Work repeats the same result request after a simulated response loss and receives/reuses the original receipt without creating a duplicate submission, output version, or job-completion side effect.
+7. The harness simulates a lost claim response and retries the same claim request; Hub restores usable access to the existing active attempt without creating a second job or second active attempt.
 
 The test fixture must be explicitly marked `transport_spike=true`, must be isolated from production content, and must use a result path that records the receipt but does not create editorial output versions or invoke any adapter. The fixture is deleted or expires through the test harness after evidence capture; no production content table is used for the proof unless the database is a separately isolated test database.
 
@@ -337,12 +348,16 @@ transport_candidate = hub_action_bearer | hub_action_oauth | github_inbox
 work_environment_identifier = <non-secret-safe-label>
 authenticated_provider = <provider>
 authenticated_subject = <provider subject or safe account label>
-work_session_id = <execution/session identifier>
+hub_work_execution_id = <server-generated execution identifier>
+provider_execution_ref = <nullable provider-native reference, metadata only>
 claim_id = <uuid>
 lease_id = <uuid>
 test_job_id = <uuid>
-request_ids = [<claim>, <result>, <replay>]
+request_ids = [<claim>, <heartbeat>, <result>, <result-replay>, <claim-recovery>]
 receipt_id = <id>
+lease_duration_seconds_proven = <integer>
+heartbeat_interval_seconds_proven = <integer>
+active_attempt_max_seconds_proven = <integer>
 duplicate_output_versions_created = 0
 ecc_or_substack_side_effects = 0
 result = pass | fail
@@ -357,8 +372,8 @@ If the spike proves a Hub action/plugin works in the actual Work environment:
 - The action/plugin is the only primary Work transport for V1A.
 - Authentication is handled by the supported API-key/Bearer or OAuth mechanism; the mechanism is documented with its provider, scopes, credential owner, and rotation procedure.
 - Hub maps the authenticated provider subject to a `content_actor_bindings` row and rejects any request-supplied actor identity.
-- Hub generates the claim token and lease ID server-side after the authenticated claim transaction succeeds.
-- The transport supplies a Work execution/session identifier, but Hub records the authenticated subject and credential reference from the transport rather than trusting the body value.
+- Hub generates the claim token, `hub_work_execution_id`, and lease ID server-side after the authenticated claim transaction succeeds.
+- A provider-native execution/session reference may be recorded as nullable metadata when the transport supplies one, but it is never a correctness or authorization dependency.
 - The action/plugin cannot call ECC or Substack adapters and cannot approve, send, or publish.
 
 ### 5.4 GitHub inbox fallback transport
@@ -367,7 +382,7 @@ If the action/plugin capability is unavailable or fails the spike, V1A uses the 
 
 - Work submits structured JSON envelopes to a dedicated private GitHub Issues inbox using its supported GitHub connection.
 - Hub verifies the repository is private, verifies the external issue/comment author against the approved Work identity, rejects pull requests and unrecognized issue/comment shapes, and treats all body text as data rather than instructions.
-- Claim, heartbeat, result, and failure operations carry request IDs and Work session identifiers in the structured envelope. The authenticated GitHub subject and external issue/comment IDs are captured by Hub and are not accepted from request text as proof of identity.
+- Claim, heartbeat, result, and failure operations carry request IDs and the server-generated `hub_work_execution_id` in the structured envelope after claim. A nullable provider-native execution reference may be included as metadata. The authenticated GitHub subject and external issue/comment IDs are captured by Hub and are not accepted from request text as proof of identity.
 - Hub polls the inbox, processes each envelope inside a transaction, and records a durable transport receipt keyed by transport plus external locator and request ID plus payload hash.
 - Hub posts the response receipt back to the issue/comment thread. Re-reading or replaying the same envelope returns the original receipt and cannot claim a second job or create a duplicate result.
 - GitHub issues/comments are closed or marked complete only after the Hub receipt is durably committed. GitHub is never the job, approval, content, or delivery source of truth.
@@ -375,7 +390,9 @@ If the action/plugin capability is unavailable or fails the spike, V1A uses the 
 
 ### 5.5 Server-generated claim and lease tokens
 
-Regardless of the selected transport, Hub generates an opaque short-lived claim token and distinct `claim_id`/`lease_id` values inside the atomic claim transaction. The token is returned only through the authenticated transport response, stored only as a hash, and is never derived from or signed by a Work-held secret. A replayed transport request cannot create a second active claim.
+Regardless of the selected transport, Hub generates an opaque short-lived claim token, a `hub_work_execution_id`, and distinct `claim_id`/`lease_id` values inside the atomic claim transaction. The token is returned only through the authenticated transport response, stored only as a hash, and is never derived from or signed by a Work-held secret. A replayed transport request cannot create a second active claim.
+
+If the original claim response is lost, an exact retry of the same claim transport request from the same authenticated subject may recover the existing active attempt. Hub verifies the durable transport receipt, request payload hash, authenticated identity, job, and unexpired lease; then rotates a new random claim token, replaces only the stored token hash, records a claim-recovery audit event, and returns the same `hub_work_execution_id`, `claim_id`, `lease_id`, and attempt number with the new token. The durable receipt stores only redacted claim metadata and never a plaintext token. A changed payload, different subject, expired lease, or different transport request ID is rejected and cannot create a second active attempt.
 
 ### 5.6 Work scopes
 
@@ -477,7 +494,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 ```
 
-The runner must acquire a single advisory lock before reading or applying migrations. Each migration runs in its own transaction. A failed migration records no applied row and blocks application startup in production.
+The runner must acquire a single advisory lock before reading or applying migrations. Each migration runs in its own transaction. A failed migration records no applied row, marks V1A migration state failed, and keeps all V1A routes and flags closed. When `CONTENT_ENGINE_V1A_ENABLED=false`, the failure must not take down the existing Freedom Hub agent, existing Substack queue, or other unaffected production functionality. V1A may not start until the failed migration is repaired by a forward fix or verified restoration.
 
 No destructive down migrations are required. Rollback means a forward-fix migration or restoration to a verified backup according to Section 24.
 
@@ -901,7 +918,8 @@ CREATE TABLE content_work_transport_receipts (
     payload_hash          CHAR(64) NOT NULL CHECK (payload_hash ~ '^[0-9a-f]{64}$'),
     authenticated_subject TEXT NOT NULL,
     credential_key_id     TEXT,
-    work_session_id       TEXT NOT NULL,
+    hub_work_execution_id TEXT NOT NULL,
+    provider_execution_ref TEXT,
     response_receipt      JSONB NOT NULL,
     created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (transport, transport_request_id),
@@ -929,14 +947,18 @@ CREATE TABLE content_work_jobs (
     claimed_by_actor_id TEXT REFERENCES content_actors(id),
     authenticated_subject TEXT,
     credential_key_id  TEXT,
-    work_session_id    TEXT,
+    hub_work_execution_id TEXT,
+    provider_execution_ref TEXT,
     claim_id           UUID,
     lease_id           UUID,
+    claim_recovery_count INTEGER NOT NULL DEFAULT 0 CHECK (claim_recovery_count >= 0),
+    last_claim_recovery_at TIMESTAMPTZ,
     claimed_at        TIMESTAMPTZ,
     lease_expires_at  TIMESTAMPTZ,
     heartbeat_at      TIMESTAMPTZ,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at        TIMESTAMPTZ NOT NULL,
+    ready_expires_at   TIMESTAMPTZ NOT NULL,
+    attempt_hard_expires_at TIMESTAMPTZ,
     completed_at      TIMESTAMPTZ,
     failure_code      TEXT,
     safe_failure_message TEXT,
@@ -945,7 +967,8 @@ CREATE TABLE content_work_jobs (
     result_received_at TIMESTAMPTZ,
     CHECK ((status IN ('claimed','working') AND claim_token_hash IS NOT NULL) OR status NOT IN ('claimed','working')),
     CHECK (lease_expires_at IS NULL OR claimed_at IS NOT NULL),
-    CHECK (expires_at > created_at)
+    CHECK (ready_expires_at > created_at),
+    CHECK (attempt_hard_expires_at IS NULL OR attempt_hard_expires_at >= claimed_at)
 );
 
 ALTER TABLE content_work_jobs
@@ -968,6 +991,10 @@ CREATE INDEX idx_content_work_jobs_expired_leases
     ON content_work_jobs(lease_expires_at)
     WHERE status IN ('claimed','working');
 
+CREATE INDEX idx_content_work_jobs_ready_expiry
+    ON content_work_jobs(ready_expires_at)
+    WHERE status = 'ready';
+
 CREATE INDEX idx_content_work_jobs_brief
     ON content_work_jobs(brief_revision_id, created_at DESC);
 ```
@@ -979,8 +1006,8 @@ CREATE TABLE content_work_job_attempts (
     attempt_number    INTEGER NOT NULL CHECK (attempt_number >= 1),
     credential_key_id TEXT,
     authenticated_subject TEXT NOT NULL,
-    work_session_id   TEXT NOT NULL,
-    worker_instance_id TEXT NOT NULL,
+    hub_work_execution_id TEXT NOT NULL,
+    provider_execution_ref TEXT,
     claim_id          UUID NOT NULL UNIQUE,
     lease_id          UUID NOT NULL,
     claim_token_hash  CHAR(64) NOT NULL,
@@ -1001,6 +1028,7 @@ CREATE TABLE content_work_submissions (
     work_job_id       UUID NOT NULL,
     request_id        UUID NOT NULL,
     attempt_number    INTEGER NOT NULL,
+    hub_work_execution_id TEXT NOT NULL,
     payload_hash      CHAR(64) NOT NULL CHECK (payload_hash ~ '^[0-9a-f]{64}$'),
     payload           JSONB,
     outcome           TEXT NOT NULL CHECK (outcome IN ('accepted','duplicate','rejected_late','rejected_invalid','rejected_mismatch','quarantined')),
@@ -1021,7 +1049,7 @@ CREATE INDEX idx_content_work_submissions_request
     ON content_work_submissions(request_id, received_at DESC);
 ```
 
-The transport receipt is the idempotency boundary for the selected Work transport. `content_work_jobs.request_id` identifies the durable job request; `content_work_transport_receipts.transport_request_id` identifies each transport operation. A reused transport request ID with a different payload hash is rejected; an exact replay returns the original receipt without a second claim, submission, version, or side effect.
+The transport receipt is the idempotency boundary for the selected Work transport. `content_work_jobs.request_id` identifies the durable job request; `content_work_transport_receipts.transport_request_id` identifies each transport operation. A reused transport request ID with a different payload hash is rejected; an exact replay returns the original receipt without a second claim, submission, version, or side effect. Claim receipts contain only redacted claim metadata and never a plaintext token; the lost-response recovery path may rotate and return a new token for the same active attempt under the rules in Section 5.5.
 
 ### 6.11 Editorial outputs, versions, evidence, and approvals
 
@@ -1223,12 +1251,29 @@ CREATE TABLE content_tracking_links (
     UNIQUE (output_version_id, channel_id, link_hash)
 );
 
+CREATE TABLE content_canonical_conversions (
+    canonical_conversion_key TEXT PRIMARY KEY,
+    canonical_owner_system   TEXT NOT NULL CHECK (canonical_owner_system IN ('ecc','memberpress','site')),
+    canonical_external_event_id TEXT NOT NULL,
+    workflow_key             TEXT,
+    occurred_at              TIMESTAMPTZ NOT NULL,
+    amount                   NUMERIC(12,2),
+    currency                 CHAR(3),
+    canonical_status         TEXT NOT NULL CHECK (canonical_status IN ('confirmed','conflict','unattributed')),
+    conflict_reason          TEXT,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (canonical_owner_system, canonical_external_event_id),
+    CHECK (amount IS NULL OR amount >= 0)
+);
+
 CREATE TABLE content_attribution_observations (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     output_version_id UUID REFERENCES content_output_versions(id),
     source_system     TEXT NOT NULL CHECK (source_system IN ('ecc','memberpress','substack','site')),
     external_event_id TEXT NOT NULL,
     event_type        TEXT NOT NULL CHECK (event_type IN ('click','order_form_visit','sale','revenue')),
+    canonical_conversion_key TEXT REFERENCES content_canonical_conversions(canonical_conversion_key),
     occurred_at       TIMESTAMPTZ NOT NULL,
     collected_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     amount            NUMERIC(12,2),
@@ -1237,7 +1282,8 @@ CREATE TABLE content_attribution_observations (
     confidence        TEXT NOT NULL CHECK (confidence IN ('high','medium','low','none')),
     attribution_window_days INTEGER NOT NULL DEFAULT 7 CHECK (attribution_window_days > 0),
     raw_reference     JSONB NOT NULL DEFAULT '{}'::jsonb,
-    UNIQUE (source_system, external_event_id, event_type)
+    UNIQUE (source_system, external_event_id, event_type),
+    CHECK (event_type NOT IN ('sale','revenue') OR canonical_conversion_key IS NOT NULL)
 );
 
 CREATE INDEX idx_content_attribution_output_time
@@ -1247,7 +1293,7 @@ CREATE INDEX idx_content_attribution_unattributed
     ON content_attribution_observations(linkage_status, occurred_at DESC);
 ```
 
-This is an imported read model. ECC remains authoritative for email revenue attribution.
+This is an imported read model. ECC remains authoritative for email revenue attribution. Revenue aggregation must use `canonical_conversion_key`, never `(source_system, external_event_id)` alone. One canonical key produces at most one counted conversion/revenue event even when supporting observations arrive from ECC, MemberPress, the site, or another source.
 
 ### 6.15 Audit events
 
@@ -1259,7 +1305,8 @@ CREATE TABLE content_audit_events (
     auth_provider     TEXT,
     authenticated_subject TEXT,
     credential_key_id TEXT,
-    work_session_id   TEXT,
+    hub_work_execution_id TEXT,
+    provider_execution_ref TEXT,
     claim_id          UUID,
     lease_id          UUID,
     event_type        TEXT NOT NULL,
@@ -1507,7 +1554,7 @@ The ECC schema compatibility change is a separately versioned ECC migration and 
 | `V1A-006` | Create output headers, immutable versions, evidence entries, approval events, output/context constraints, approval-hash validation, and editorial append-only triggers |
 | `V1A-007` | Create external references, delivery attempts, output/version pairing constraints, exact-approved-version trigger, idempotency constraints, and reconcile indexes |
 | `V1A-008` | Create workflow authority table and seed `email_7day_clicker` with ECC authority and Hub generation disabled |
-| `V1A-009` | Create tracking links, tracking-channel validation, attribution observations, audit events, audit append-only trigger, and indexes |
+| `V1A-009` | Create tracking links, tracking-channel validation, canonical conversion keys, attribution observations, audit events, audit append-only trigger, and indexes |
 | `V1A-010` | Seed only `substack_article` and `email_7day_clicker`; seed initial runtime settings; validate schema invariants |
 
 ### 7.1 Migration rules
@@ -1516,7 +1563,7 @@ The ECC schema compatibility change is a separately versioned ECC migration and 
 - Never run a migration concurrently from two application replicas.
 - Never drop or truncate existing Substack/ECC tables as part of V1A.
 - Never backfill production content as authoritative without an explicit mapping and verification report.
-- A failed migration blocks V1A startup but must not silently prevent the existing Hub agent or existing Substack queue from operating if the feature flag is disabled.
+- A failed migration fails V1A closed but must not prevent the existing Hub agent, existing Substack queue, or other unaffected production functionality from operating when V1A is disabled.
 - V1A routes must not become active until every required migration is recorded as applied and verified.
 
 ### 7.2 Required database migration tests
@@ -1543,7 +1590,7 @@ All schemas below are `schema_version: 1`. Unknown fields are rejected on writes
   "schema_version": 1,
   "transport_request_id": "uuid",
   "requested_job_id": "optional-uuid",
-  "work_session_id": "work-session-2026-09-12-01",
+  "provider_execution_ref": null,
   "max_wait_seconds": 0
 }
 ```
@@ -1585,10 +1632,13 @@ Rules:
       }
     ],
     "context_snapshot": {},
-    "expires_at": "2026-09-12T16:00:00Z"
+    "ready_expires_at": "2026-10-12T16:00:00Z",
+    "attempt_hard_expires_at": "2026-09-12T14:11:00Z"
   },
   "claim": {
     "claim_token": "opaque-short-lived-token",
+    "hub_work_execution_id": "uuid",
+    "provider_execution_ref": null,
     "claim_id": "uuid",
     "lease_id": "uuid",
     "lease_expires_at": "2026-09-12T12:15:00Z",
@@ -1598,7 +1648,7 @@ Rules:
 }
 ```
 
-The claim token is returned only over the authenticated response and is never stored in plaintext. Hub stores its SHA-256 hash.
+The claim token is returned only over the authenticated response and is never stored in plaintext. Hub stores its SHA-256 hash. The response also returns the server-generated `hub_work_execution_id`; this is the execution identity used by all later operations.
 
 ### 8.3 Heartbeat request
 
@@ -1609,12 +1659,13 @@ The claim token is returned only over the authenticated response and is never st
   "job_id": "uuid",
   "request_id": "uuid",
   "claim_token": "opaque-short-lived-token",
-  "work_session_id": "work-session-2026-09-12-01",
+  "hub_work_execution_id": "uuid",
+  "provider_execution_ref": null,
   "progress": "drafting both requested outputs"
 }
 ```
 
-The server verifies the token, active lease, request ID, worker instance, and hard `expires_at`. It extends the lease by 10 minutes, never beyond the job hard expiry. A heartbeat after lease expiry returns `409 LEASE_EXPIRED`.
+The server verifies the token, active lease, request ID, `hub_work_execution_id`, and authenticated transport identity. It extends the lease by the proven heartbeat extension, never beyond `attempt_hard_expires_at`. A heartbeat after lease expiry returns `409 LEASE_EXPIRED`.
 
 ### 8.4 Result submission
 
@@ -1626,9 +1677,12 @@ The server verifies the token, active lease, request ID, worker instance, and ha
   "request_id": "uuid",
   "claim_token": "opaque-short-lived-token",
   "attempt_number": 1,
-  "work_session_id": "work-session-2026-09-12-01",
+  "hub_work_execution_id": "uuid",
+  "provider_execution_ref": null,
   "claim_id": "uuid",
   "lease_id": "uuid",
+  "context_snapshot_id": "uuid",
+  "context_hash": "64-hex",
   "submitted_at": "2026-09-12T12:11:00Z",
   "outputs": [
     {
@@ -1670,6 +1724,8 @@ V1A result rules:
 - Missing or extra output keys cause `PARTIAL_RESULT` or `EXTRA_OUTPUT` and create no output versions.
 - The complete package is accepted atomically or rejected atomically.
 - Work cannot submit only the Substack or only the email output.
+- `context_snapshot_id` and `context_hash` must exactly equal the claimed job’s immutable context snapshot ID and hash. A mismatch returns `CONTEXT_HASH_MISMATCH` and creates no output versions.
+- `hub_work_execution_id`, `claim_id`, `lease_id`, and `attempt_number` must exactly identify the active claimed attempt.
 - A duplicate transport request with the same payload hash returns the original receipt and creates no new versions.
 - A duplicate transport request ID with a different payload hash returns `409 RESULT_HASH_MISMATCH`.
 - A late result after hard expiry creates a quarantined submission record but no versions and no delivery reference.
@@ -1684,6 +1740,8 @@ V1A result rules:
   "job_id": "uuid",
   "request_id": "uuid",
   "claim_token": "opaque-short-lived-token",
+  "hub_work_execution_id": "uuid",
+  "provider_execution_ref": null,
   "attempt_number": 1,
   "failure_code": "SOURCE_UNAVAILABLE",
   "safe_failure_message": "The selected source could not be read.",
@@ -1701,38 +1759,40 @@ The failure message must not include secrets, raw source bodies, subscriber data
 
 Claiming a job occurs in one database transaction:
 
-1. Verify the selected transport authentication, external identity, scope, work session, and transport request receipt.
+1. Verify the selected transport authentication, external identity, scope, provider-native metadata if present, and transport request receipt.
 2. Begin transaction.
 3. Select the requested job or oldest eligible job using `FOR UPDATE SKIP LOCKED`.
 4. Eligible states are `ready`, or `claimed/working` with expired lease and remaining attempts before hard expiry.
 5. Increment `attempt_count`.
 6. Generate cryptographically random `claim_id`, `lease_id`, and an opaque claim token.
-7. Store only the claim-token hash; store the non-secret claim/lease/session identifiers and authenticated identity metadata.
-8. Set `status = 'claimed'`, server-derived `claimed_by_actor_id`, `authenticated_subject`, `credential_key_id`, `work_session_id`, `claim_id`, `lease_id`, `claimed_at`, `heartbeat_at`, `lease_expires_at`, and the attempt row.
+7. Store only the claim-token hash; store the non-secret `hub_work_execution_id`, claim/lease identifiers, optional provider-native reference, and authenticated identity metadata.
+8. Set `status = 'claimed'`, server-derived `claimed_by_actor_id`, `authenticated_subject`, `credential_key_id`, `hub_work_execution_id`, optional `provider_execution_ref`, `claim_id`, `lease_id`, `claimed_at`, `heartbeat_at`, `lease_expires_at`, `attempt_hard_expires_at`, and the attempt row.
 9. Commit.
 10. Return the package and plaintext claim token.
 
-No two successful claim responses may reference the same active attempt. A duplicate transport claim request returns the original receipt or the existing active lease and cannot claim another job.
+No two successful claim responses may reference the same active attempt unless the second response is a safe claim-response recovery for the same transport request, authenticated identity, job, and lease. A duplicate transport claim request cannot create another job or active attempt.
 
 ### 9.2 Lease rules
 
-- Initial lease: 10 minutes
-- Heartbeat interval: every 2 minutes
-- Heartbeat extension: 10 minutes from current request time
-- Maximum hard job lifetime: 2 hours from `created_at`
+- Initial lease: 10 minutes, subject to the capability-spike evidence
+- Heartbeat interval: the interval proven reliable by Casey’s actual Work environment
+- Heartbeat extension: the extension proven reliable by Casey’s actual Work environment
+- Ready-job expiry: 30 days from `created_at` by default, so an untouched ready job remains available for Casey to initiate later
+- Active attempt maximum: 2 hours from successful claim by default, measured by `attempt_hard_expires_at`, not from job creation
 - Maximum attempts: 2 by default
-- A lease may not extend beyond `expires_at`
-- A claim token is valid only for its attempt, job, request ID, and worker instance
+- A lease may not extend beyond `attempt_hard_expires_at`
+- A claim token is valid only for its attempt, job, request ID, and `hub_work_execution_id`
 - A new claim invalidates the prior claim token by replacing its hash
 
 ### 9.3 Recovery sweeper
 
 A Hub-owned recovery operation runs at least every 5 minutes but is not an audience-facing publisher.
 
-For `claimed` or `working` jobs with `lease_expires_at < NOW()`:
+For `ready` jobs with `ready_expires_at < NOW()`, set `status = 'expired'`. For `claimed` or `working` jobs with `lease_expires_at < NOW()`:
 
-- If `attempt_count < max_attempts` and `expires_at > NOW()`, record `lease_expired` and return the job to `ready`.
-- If the hard expiry has passed, set `status = 'expired'`.
+- If `attempt_count < max_attempts` and `ready_expires_at > NOW()`, record `lease_expired` and return the job to `ready`.
+- If `ready_expires_at` has passed while the job is still untouched, set `status = 'expired'`.
+- If `attempt_hard_expires_at` has passed for an active attempt, mark that attempt `lease_expired`; return the job to `ready` only when `ready_expires_at` remains in the future and another attempt is allowed.
 - If a result submission was received but could not be committed atomically, set `status = 'needs_reconciliation'` and block all delivery.
 
 The sweeper must never create output versions or external references.
@@ -2210,13 +2270,14 @@ content-engine:substack_article:<output-version-id>
 ```
 
 4. Hub checks `content_external_references` for an existing non-cancelled mapping.
-5. Hub calls the existing `agent/substack.py` queue storage/adapter path with title, subtitle, Markdown body, audience, and paywall configuration. This updates or creates the existing Hub-owned `substack_drafts` row; it does not create a second queue.
-6. Existing Substack validation remains active, including unresolved-placeholder and image validation.
-7. Hub stores the returned `substack_drafts.id` as `external_id`.
-8. Hub stores the existing Hub queue receipt ID and exact approved-version mapping.
-9. The browser extension retrieves the queued draft using its existing separate extension credential and transfers it into the authenticated Substack editor.
-10. The extension may report the Hub queue/receipt state as `transferred`; this is not Substack publication confirmation.
-11. Casey publishes manually in the authenticated Substack editor. `published` requires Substack confirmation or Casey’s explicit manual record of the Substack post ID and post URL.
+5. If an existing queued draft is found, Hub may update/reuse it only when its durable mapping has the same exact `output_version_id`. An unrelated queued draft with the same normalized title is a collision, not a reusable draft: Hub returns `EXTERNAL_DUPLICATE`/`SUBSTACK_TITLE_COLLISION`, creates no update, and requires Casey reconciliation.
+6. If no same-version mapping exists, Hub calls the existing `agent/substack.py` queue storage/adapter path with title, subtitle, Markdown body, audience, and paywall configuration. This updates or creates the existing Hub-owned `substack_drafts` row; it does not create a second queue.
+7. Existing Substack validation remains active, including unresolved-placeholder and image validation.
+8. Hub stores the returned `substack_drafts.id` as `external_id`.
+9. Hub stores the existing Hub queue receipt ID and exact approved-version mapping.
+10. The browser extension retrieves the queued draft using its existing separate extension credential and transfers it into the authenticated Substack editor.
+11. The extension may report the Hub queue/receipt state as `transferred`; this is not Substack publication confirmation.
+12. Casey publishes manually in the authenticated Substack editor. `published` requires Substack confirmation or Casey’s explicit manual record of the Substack post ID and post URL.
 
 ### 14.3 Existing Substack compatibility
 
@@ -2224,13 +2285,13 @@ The existing private GPT Action and GitHub inbox remain supported for legacy art
 
 V1A content must enter the existing queue only through the Hub adapter after exact-version approval.
 
-Retries use the same idempotency key and must reuse or reconcile the existing Hub-queued draft rather than create a duplicate. Browser/session state is never used as the durable retry or publication source of truth.
+Retries use the same idempotency key and must reuse or reconcile the existing Hub-queued draft only when the durable mapping is for the same exact Hub `output_version_id`. A same-title legacy or unrelated draft must never be overwritten by V1A. Browser/session state is never used as the durable retry or publication source of truth.
 
 ### 14.4 Existing Substack credential boundary
 
 The current Freedom Hub queue path is `agent/substack.py`, including `POST /api/v1/substack/drafts` and its internal `_store_substack_draft()` function. V1A may reuse that validated storage path, but it must introduce an explicit V1A adapter-authentication branch using `SUBSTACK_CONTENT_ENGINE_ADAPTER_KEY` (or an equivalent separately scoped credential). The legacy `SUBSTACK_ACTION_SECRET` used by the existing private GPT Action and the browser extension credential must remain separate and must never be given to Work.
 
-The queue route must record whether the caller is the V1A adapter or the legacy action, and V1A calls must still require exact approved-version validation in Hub before invoking the queue path. The existing same-title replacement behavior may remain, but the Hub external-reference mapping and idempotency key are the authoritative duplicate/retry guard.
+The queue route must record whether the caller is the V1A adapter or the legacy action, and V1A calls must still require exact approved-version validation in Hub before invoking the queue path. The existing same-title replacement behavior may remain for legacy workflows only. For V1A, the Hub external-reference mapping and idempotency key are the authoritative duplicate/retry guard, and an unrelated same-title draft is never eligible for replacement.
 
 ---
 
@@ -2266,7 +2327,26 @@ When multiple eligible clicks exist, select the latest valid click before the co
 
 ECC remains canonical for email revenue attribution. Hub imports the result and its confidence rather than recalculating a competing revenue number.
 
-### 15.3 Attribution observation mapping
+### 15.3 Canonical conversion and revenue deduplication
+
+For `email_7day_clicker`, ECC is the canonical email-revenue owner. The canonical conversion key is the stable ECC conversion identifier, normalized as:
+
+```text
+ecc:<stable-ecc-conversion-id>
+```
+
+The key must identify the completed conversion/order, not a click, email draft, webhook delivery, or source-system observation. ECC creates or confirms the corresponding `content_canonical_conversions` row. MemberPress, site, and other source observations may point to that same key only when an exact transaction/order identity or an approved deterministic identity bridge proves they describe the same conversion. A source-specific event ID alone never creates a second counted conversion.
+
+Aggregation rules:
+
+- Count at most one confirmed revenue event per `canonical_conversion_key`.
+- Supporting observations from multiple systems remain auditable, but never add revenue or conversion count a second time.
+- For the migrated email workflow, an ECC-confirmed value is canonical even when MemberPress or site observations contain the same conversion.
+- If two sources disagree on amount, currency, completion state, or conversion identity, retain both observations, mark the canonical row `conflict`, record `conflict_reason`, and do not sum them. For `email_7day_clicker`, do not replace an ECC-confirmed value with a supporting-source value; escalate the conflict for reconciliation.
+- If ECC has not confirmed the conversion, MemberPress/site observations remain supporting or `unattributed` and are not promoted into email revenue by Hub.
+- Pending, incomplete, refunded, or cancelled transactions do not count as confirmed revenue unless ECC’s canonical owner state explicitly confirms the eligible conversion under its existing rules.
+
+### 15.4 Attribution observation mapping
 
 Hub imports only normalized observations and safe references:
 
@@ -2284,7 +2364,7 @@ output_version_id when legitimately linked
 
 No raw subscriber records are copied into Hub.
 
-### 15.4 Required propagation tests
+### 15.5 Required propagation tests
 
 The controlled test suite must prove:
 
@@ -2505,7 +2585,7 @@ AUTH_SCOPE_DENIED
 TRANSPORT_SPIKE_REQUIRED
 TRANSPORT_UNSUPPORTED
 TRANSPORT_REPLAY
-WORK_SESSION_INVALID
+WORK_EXECUTION_INVALID
 PAYLOAD_TOO_LARGE
 JOB_NOT_FOUND
 JOB_NOT_CLAIMABLE
@@ -2609,25 +2689,26 @@ SUBSTACK_CONTENT_ENGINE_ADAPTER_KEY
 - A duplicate claim request cannot claim a second job after a response timeout.
 - Credential/connection rotation follows the proven provider mechanism and preserves in-flight lease safety.
 - Human actor identity is derived from the authenticated Hub owner session, not request text.
-- Work session, credential reference, claim ID, and lease ID are present in job attempts and audit events.
+- The server-generated `hub_work_execution_id`, optional provider reference, credential reference, claim ID, and lease ID are present in job attempts, transport receipts, and audit events.
 - Error responses do not leak credentials or raw recipient data.
 
 ### 21.3 Work job tests
 
 - Two concurrent claims cannot claim the same job.
 - Claim returns one plaintext token and stores only its hash.
+- A lost claim response can be recovered by replaying the exact claim request from the same authenticated identity; recovery rotates a token for the same attempt and creates no second job or active attempt.
 - Wrong token cannot heartbeat or submit.
-- Heartbeat extends the lease but not beyond hard expiry.
+- Heartbeat extends the lease but not beyond the proven active-attempt maximum.
 - Lease expiry returns a job to ready when attempts remain.
 - Hard expiry produces `expired`.
 - Interrupted result transaction produces `needs_reconciliation` rather than disappearing.
 - Late result after expiry creates no output version.
 - Same result replay returns the original receipt and creates no duplicate versions.
-- The transport-capability spike passes authentication, harmless retrieval, atomic claim, harmless result, and receipt replay with zero output versions and zero external side effects.
+- The transport-capability spike passes authentication, harmless retrieval, atomic claim, server-generated execution/claim/lease identity, heartbeat/lease extension, harmless result, result replay/idempotency, and lost-claim-response recovery with zero output versions and zero external side effects.
 - Different result with the same request ID is rejected.
 - Partial result creates no output versions.
 - Extra output creates no output versions.
-- Context hash mismatch is rejected.
+- Context snapshot ID mismatch and context hash mismatch are rejected with `CONTEXT_HASH_MISMATCH`.
 - Attempt count and attempt rows remain consistent.
 
 ### 21.4 Editorial/version tests
@@ -2679,6 +2760,7 @@ SUBSTACK_CONTENT_ENGINE_ADAPTER_KEY
 - Exact approved version creates one queued draft.
 - Duplicate handoff reuses the existing queued draft.
 - Existing title-replacement behavior remains intact where intended.
+- An unrelated queued draft with the same normalized title is rejected and never overwritten by V1A.
 - Existing image and placeholder validation remains active.
 - Extension transfer updates the external reference but does not publish.
 - Non-approved version is rejected.
@@ -2699,6 +2781,8 @@ SUBSTACK_CONTENT_ENGINE_ADAPTER_KEY
 - Opens do not create attribution.
 - Anonymous conversions remain unattributed.
 - Duplicate external events are deduplicated.
+- ECC, MemberPress, and site observations for one exact conversion share one canonical conversion key and count once.
+- Conflicting amount, currency, or completion state is retained as a conflict and never summed as a second revenue event; ECC remains canonical for `email_7day_clicker`.
 
 ### 21.9 Backpressure and fail-closed tests
 
@@ -2738,7 +2822,7 @@ CONTENT_ENGINE_DELIVERY_ENABLED=false
 CONTENT_ENGINE_EMAIL_7D_AUTHORITY=ecc
 ```
 
-The exact configuration mechanism may use Railway environment variables plus the database workflow-authority row, but the effective state must be visible in Hub and audited. `CONTENT_ENGINE_WORK_TRANSPORT` may become `hub_action_bearer`, `hub_action_oauth`, or `github_inbox` only after the capability spike passes; `unproven` blocks Work routes.
+`CONTENT_ENGINE_DELIVERY_ENABLED` controls only Hub’s external-draft/queue handoff: when true, and the relevant ECC/Substack adapter flag is also true, an approved exact version may create or update the ECC operational draft or existing Hub-owned Substack queue item. It never sends an email, schedules a send, publishes Substack, or bypasses Casey’s final manual action. There is no V1A automatic-send or automatic-publish mode. The effective state must be visible in Hub and audited. `CONTENT_ENGINE_WORK_TRANSPORT` may become `hub_action_bearer`, `hub_action_oauth`, or `github_inbox` only after the capability spike passes; `unproven` blocks Work routes.
 
 ### 22.2 Dark launch
 
@@ -2763,7 +2847,7 @@ After dark-launch validation:
 3. Verify the ECC payload maps to `__clicked_last_7__` without creating a live draft, or create an explicitly Casey-only test draft if the adapter requires a real record.
 4. Verify the Substack payload without creating a public publication.
 5. Verify duplicate and retry behavior.
-6. Keep `CONTENT_ENGINE_DELIVERY_ENABLED=false`.
+6. Keep `CONTENT_ENGINE_DELIVERY_ENABLED=false`; the canary must prove payloads without creating an external draft/queue handoff unless Casey explicitly authorizes an isolated Casey-only test record.
 
 ### 22.4 First controlled production loop
 
@@ -2771,7 +2855,7 @@ After dark-launch validation:
 2. Casey authorizes workflow cutover.
 3. Set ECC authority to Hub for `email_7day_clicker`.
 4. Disable existing ECC generation for the reserved audience.
-5. Enable Hub Work and adapter creation, but keep sending and publishing manual.
+5. Enable Hub Work, the relevant adapter flags, and `CONTENT_ENGINE_DELIVERY_ENABLED=true` so Hub can create the approved ECC draft and Substack queue item; keep final email sending, scheduling, and Substack publishing manual.
 6. Run exactly one package.
 7. Casey approves exact versions.
 8. Hub creates one ECC draft and one Substack queue item.
@@ -2788,7 +2872,6 @@ After dark-launch validation:
 
 - [ ] This implementation specification is approved.
 - [ ] The actual Railway PostgreSQL `version()`, `server_version_num`, `server_version`, and `pgcrypto` extension version are recorded; the verified major is at least 13.
-- [ ] Migration tests pass against PostgreSQL 13 and the exact verified Railway production version.
 - [ ] ECC production API authentication is deployed and verified.
 - [ ] ECC read-only and draft-write credentials are scoped separately.
 - [ ] ECC `email_drafts` schema compatibility is verified: array `segment_target`, reserved-token support, approved `email_type`, UUID draft IDs, and mapping-table constraints.
@@ -2819,6 +2902,14 @@ After dark-launch validation:
 - [ ] Verify evidence validation.
 - [ ] Verify no external draft or queue item exists.
 - [ ] Verify no email send or publication occurred.
+
+### Pre-cutover gates
+
+- [ ] The complete automated V1A test suite passes in a non-production environment.
+- [ ] ECC authority/database enforcement is installed and verified: writer guard, database trigger, deferred exact-version mapping constraint, unique exact-version index, and adapter database role.
+- [ ] The dark launch passes with no external draft/queue handoff, send, or publication.
+- [ ] The internal adapter canary passes with no audience-facing send or publication.
+- [ ] Rollback checks pass, including authority rollback, reconciliation handling, and manual-only final delivery.
 
 ### Cutover
 
@@ -2929,33 +3020,39 @@ The implementation should proceed in this order, with tests and review after eac
 - Review
 - Minimal Pipeline
 
-### Phase 7 — Dark launch and acceptance
+### Pre-cutover gates (not an implementation phase)
 
-- Clean and populated migration tests
-- Internal shadow job
-- Adapter dry run
-- One controlled manual production loop
+- Complete automated V1A test suite
+- ECC authority/database enforcement installed and verified
+- Dark launch
+- Internal adapter canary
 - Attribution propagation proof
 - Rollback rehearsal
 
-Only after Phase 7 is reliable may Casey consider adding another channel in a separate specification.
+Only after Phases 0–6 and all pre-cutover gates are reliable may Casey authorize the first controlled production loop. Adding another channel requires a separate specification.
 
 ---
 
 ## 26. Final implementation gate
 
-Production implementation may begin only after the following are explicitly approved:
+### Pre-code authorization
 
-1. The actual ChatGPT Work transport-capability spike passes and the proven transport is documented as either the supported Hub action/plugin mechanism or the private GitHub inbox fallback.
-2. Work authentication/connection and adapter credentials are separate and scoped; no client-side HMAC secret is assumed.
-3. The exact ECC 7-Day Clicker writer paths and cutover guard are confirmed.
-4. The Hub-only approved-version handoff rule is confirmed.
-5. The exact ECC draft mapping and Substack external-reference design are confirmed.
-6. The deterministic tracking fields and ECC `/go/` behavior are confirmed.
-7. The controlled attribution propagation test plan is approved.
-8. The migration runner, backup, dark-launch, canary, and rollback procedures are approved.
-9. The complete automated test plan passes in a non-production environment.
-10. The verified Railway PostgreSQL production version is recorded, is at least PostgreSQL 13, and the migration test matrix passes against that exact version.
-11. Casey gives explicit approval to begin implementation.
+Implementation may begin through Phases 0–6 only after these are explicitly approved or recorded:
 
-Until then, this document is the implementation contract for review only.
+1. Casey approves this implementation specification.
+2. The verified Railway PostgreSQL production version and `pgcrypto` extension version are recorded; the verified major is at least PostgreSQL 13.
+3. The actual ChatGPT Work transport-capability spike passes and documents the proven transport as either the supported Hub action/plugin mechanism or the private GitHub inbox fallback.
+4. Work authentication/connection and adapter credentials are separate and scoped; no client-side HMAC secret is assumed.
+
+### Pre-cutover authorization
+
+The first controlled production loop may begin only after these additional gates pass:
+
+1. The complete automated V1A test suite passes in a non-production environment.
+2. ECC authority/database enforcement is installed and verified.
+3. The dark launch and internal adapter canary pass without audience-facing send or publication.
+4. The migration runner, backup, reconciliation, and rollback checks pass.
+5. The exact ECC draft mapping, Substack external-reference collision protection, deterministic tracking fields, ECC `/go/` behavior, and canonical revenue deduplication behavior are verified.
+6. Casey explicitly authorizes workflow cutover.
+
+Until the pre-code gates close, this document is the implementation contract for review only. Until the pre-cutover gates close, V1A remains disabled and no audience-facing send or publication is permitted.
