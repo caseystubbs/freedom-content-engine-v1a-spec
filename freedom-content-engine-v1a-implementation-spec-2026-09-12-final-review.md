@@ -2,6 +2,7 @@
 ## V1A Implementation Specification
 
 **Status:** Final-review draft — pre-code approval, PostgreSQL, and Work transport gates remain open; do not implement yet
+
 **Architecture source:** *Freedom Content Engine — Architecture Approved for V1A Implementation*  
 **Scope:** V1A only  
 **Date:** September 12, 2026  
